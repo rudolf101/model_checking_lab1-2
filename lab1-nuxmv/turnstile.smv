@@ -1,0 +1,164 @@
+-- =====================================================================
+-- Лабораторная работа №1. Турникет в метро (вариант 2 из CS2025)
+-- Входной язык nuXmv, синхронная композиция модулей.
+--
+-- Компоненты (каждый модуль = отдельный «процесс» системы):
+--   Passenger     - пользователь/среда: время от времени подходит и
+--                   недетерминированно предъявляет карту или жетон
+--   Intruder      - среда: «безбилетник», пытается проскочить следом
+--   CardReader    - датчик: валидатор карт (есть деньги / нет денег)
+--   TokenAcceptor - датчик: приёмник жетонов (правильный / посторонний)
+--   PassSensor    - датчик: фотоэлемент в проходе
+--   Controller    - управляющий алгоритм
+--   Gate          - актуатор: створки
+--   Lamp          - актуатор/индикатор: табло (зелёный / красный)
+--
+-- Каждый модуль реагирует на значения остальных с задержкой в 1 такт.
+-- =====================================================================
+
+MODULE Passenger(gate_pos, lamp_light)
+VAR
+  st    : {away, approach, wait, walk};
+  media : {none, card_ok, card_empty, token_ok, token_bad};
+ASSIGN
+  init(st)    := away;
+  init(media) := none;
+  next(st) := case
+    st = away                      : {away, approach}; -- приходит когда угодно
+    st = approach                  : wait;             -- приложил карту / бросил жетон
+    st = wait & gate_pos = open    : walk;             -- створки открыты - идёт
+    st = wait & lamp_light = red   : away;             -- отказ - уходит
+    st = walk                      : away;             -- прошёл
+    TRUE                           : st;
+  esac;
+  next(media) := case
+    st = away & next(st) = approach : {card_ok, card_empty, token_ok, token_bad};
+    next(st) = away                 : none;
+    TRUE                            : media;
+  esac;
+
+MODULE Intruder(gate_pos)
+VAR
+  st : {none, behind, sneak};
+ASSIGN
+  init(st) := none;
+  next(st) := case
+    st = none                     : {none, behind};
+    st = behind & gate_pos = open : {behind, sneak, none}; -- может проскочить
+    st = behind                   : {behind, none};
+    st = sneak                    : none;
+    TRUE                          : st;
+  esac;
+
+-- Датчик держит результат, пока контроллер его не заберёт (латч)
+MODULE CardReader(user_st, user_media, ctrl_st)
+VAR
+  res : {none, ok, fail};
+ASSIGN
+  init(res) := none;
+  next(res) := case
+    res != none & ctrl_st = idle                               : none;
+    res = none & user_st = approach & user_media = card_ok     : ok;
+    res = none & user_st = approach & user_media = card_empty  : fail;
+    TRUE                                                       : res;
+  esac;
+
+MODULE TokenAcceptor(user_st, user_media, ctrl_st)
+VAR
+  res : {none, ok, fail};
+ASSIGN
+  init(res) := none;
+  next(res) := case
+    res != none & ctrl_st = idle                               : none;
+    res = none & user_st = approach & user_media = token_ok    : ok;
+    res = none & user_st = approach & user_media = token_bad   : fail;
+    TRUE                                                       : res;
+  esac;
+
+-- Фотоэлемент: луч перекрыт, если в проходе кто-то есть
+MODULE PassSensor(user_st, intr_st)
+VAR
+  beam : boolean;
+ASSIGN
+  init(beam) := FALSE;
+  next(beam) := user_st = walk | intr_st = sneak;
+
+MODULE Controller(card_res, token_res, beam, gate_pos)
+VAR
+  st : {idle, granted, denied, closing};
+ASSIGN
+  init(st) := idle;
+  next(st) := case
+    st = idle & (card_res = ok   | token_res = ok)   : granted;
+    st = idle & (card_res = fail | token_res = fail) : denied;
+    st = granted & beam                              : closing;
+    st = denied                                      : idle;
+    st = closing & gate_pos = closed                 : idle;
+    TRUE                                             : st;
+  esac;
+DEFINE
+  open_cmd := st = granted;
+
+MODULE Gate(open_cmd)
+VAR
+  pos : {closed, open};
+ASSIGN
+  init(pos) := closed;
+  next(pos) := open_cmd ? open : closed;
+
+MODULE Lamp(ctrl_st)
+VAR
+  light : {off, green, red};
+ASSIGN
+  init(light) := off;
+  next(light) := case
+    ctrl_st = granted : green;
+    ctrl_st = denied  : red;
+    TRUE              : off;
+  esac;
+
+MODULE main
+VAR
+  user  : Passenger(gate.pos, lamp.light);
+  intr  : Intruder(gate.pos);
+  card  : CardReader(user.st, user.media, ctrl.st);
+  token : TokenAcceptor(user.st, user.media, ctrl.st);
+  sens  : PassSensor(user.st, intr.st);
+  ctrl  : Controller(card.res, token.res, sens.beam, gate.pos);
+  gate  : Gate(ctrl.open_cmd);
+  lamp  : Lamp(ctrl.st);
+DEFINE
+  paid     := card.res = ok   | token.res = ok;    -- датчик подтвердил оплату
+  rejected := card.res = fail | token.res = fail;  -- датчик отклонил оплату
+
+-- ---------------------------------------------------------------------
+-- P1 (CTL, безопасность с Until): если оплата отклонена, створки
+--    остаются закрытыми, пока не загорится красный сигнал.
+CTLSPEC NAME p1_reject_keeps_closed :=
+  AG (rejected -> A [ gate.pos = closed U lamp.light = red ])
+
+-- P2 (LTL, отклик G(p -> F q)): пассажир, чья оплата подтверждена,
+--    обязательно пройдёт через турникет.
+LTLSPEC NAME p2_paid_passes :=
+  G (paid -> F user.st = walk)
+
+-- P3 (LTL, X и U): открывшиеся створки остаются открытыми, пока
+--    датчик прохода не зафиксирует проход.
+LTLSPEC NAME p3_open_until_pass :=
+  G ((gate.pos = closed & X gate.pos = open) -> X (gate.pos = open U sens.beam))
+
+-- P4 (LTL, инвариант; ОЖИДАЕТСЯ НАРУШЕНИЕ): без оплаты пройти нельзя.
+--    Контрпример - «паровозик» (tailgating), разбор в отчёте.
+LTLSPEC NAME p4_no_free_ride :=
+  G !(intr.st = sneak)
+
+-- ---------------------------------------------------------------------
+-- Проверки нетривиальности посылок: из любого достижимого состояния
+-- посылка снова достижима => она может выполняться бесконечно часто.
+CTLSPEC NAME v1_rejected_recurs := AG EF rejected
+CTLSPEC NAME v2_paid_recurs     := AG EF paid
+CTLSPEC NAME v3_opening_recurs  := AG EF (gate.pos = closed & EX gate.pos = open)
+CTLSPEC NAME v4_card_and_token  := AG (EF card.res = ok & EF token.res = ok
+                                       & EF card.res = fail & EF token.res = fail)
+-- Система не «зависает»: в исходное состояние можно вернуться всегда
+CTLSPEC NAME v5_can_return_idle := AG EF (ctrl.st = idle & gate.pos = closed & user.st = away)

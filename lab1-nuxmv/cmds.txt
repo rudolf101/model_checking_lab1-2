@@ -1,0 +1,10 @@
+set on_failure_script_quits 1
+read_model -i turnstile.smv
+flatten_hierarchy
+encode_variables
+build_model
+print_reachable_states
+check_fsm
+check_ctlspec
+check_ltlspec
+quit
